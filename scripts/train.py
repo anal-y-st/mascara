@@ -15,6 +15,42 @@ def import_function(dotted: str):
     fn = getattr(mod, func_name)
     return fn
 
+def parse_value(value_str: str):
+    """Parse a string value to its appropriate type (int, float, bool, or str)"""
+    value_str = value_str.strip()
+    
+    # Handle boolean values
+    if value_str.lower() in ('true', 'false'):
+        return value_str.lower() == 'true'
+    
+    # Handle None
+    if value_str.lower() in ('none', 'null'):
+        return None
+    
+    # Try to parse as int
+    try:
+        if '.' not in value_str and 'e' not in value_str.lower():
+            return int(value_str)
+    except ValueError:
+        pass
+    
+    # Try to parse as float
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    
+    # Handle lists/arrays (basic support for comma-separated values)
+    if value_str.startswith('[') and value_str.endswith(']'):
+        inner = value_str[1:-1].strip()
+        if inner:
+            items = [parse_value(item.strip()) for item in inner.split(',')]
+            return items
+        return []
+    
+    # Return as string if nothing else works
+    return value_str
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Chemin du YAML de config")
@@ -25,13 +61,17 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    # Parse overrides
+    # Parse overrides with proper type conversion
     pairs = []
     for s in args.__dict__.get("set", []) or []:
         if "=" not in s:
             raise ValueError(f"Invalid --set '{s}', expected key=value")
         k, v = s.split("=", 1)
-        pairs.append((k.strip(), v.strip()))
+        key = k.strip()
+        parsed_value = parse_value(v.strip())
+        pairs.append((key, parsed_value))
+        print(f"Override: {key} = {parsed_value} (type: {type(parsed_value).__name__})")
+    
     cfg = override_config(cfg, pairs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,10 +79,12 @@ def main():
 
     get_loaders = import_function(args.loaders)
     train_loader, val_loader, stats = get_loaders(cfg)
-    input_mean = stats.get("input_mean", 0.0)
-    input_std  = stats.get("input_std", 1.0)
-    label_mean = stats.get("label_mean", 0.0)
-    label_std  = stats.get("label_std", 1.0)
+    
+    # Ensure stats values are properly typed
+    input_mean = float(stats.get("input_mean", 0.0))
+    input_std  = float(stats.get("input_std", 1.0))
+    label_mean = float(stats.get("label_mean", 0.0))
+    label_std  = float(stats.get("label_std", 1.0))
 
     best, history = train_and_evaluate(
         model=model,
