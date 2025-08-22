@@ -1,0 +1,27 @@
+model:
+  name: "AdvancedSwinUNet"
+  in_ch: 18
+  out_ch: 1
+  embed_dim: 120
+  depth: 3
+  heads: 5
+  img_size: [128, 128]
+
+training:
+  epochs: 30
+  lr: 1e-4
+  weight_decay: 1e-2
+  outdir: "results_swin"
+  alpha: 0.5    # Huber
+  beta: 0.3     # R2
+  gamma: 0.2    # SSIM
+  amp: true     # mixed precision
+  clip_grad: 1.0
+  scheduler:
+    name: "plateau"   # "plateau" or "none"
+    factor: 0.5
+    patience: 4
+  early_stopping:
+    enabled: true
+    patience: 10
+  seed: 1337
