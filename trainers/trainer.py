@@ -10,7 +10,7 @@ from utils.visualization import plot_curves, save_prediction
 from utils.reporting import save_report
 
 def evaluate_model_exact(model, loader, device, label_mean=None, label_std=None):
-    """Version EXACTE de votre fonction evaluate_model"""
+    """Version EXACTE de votre fonction evaluate_model avec gestion des NaN"""
     from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
     
     model.eval()
@@ -20,6 +20,13 @@ def evaluate_model_exact(model, loader, device, label_mean=None, label_std=None)
             xb = xb.to(device)
             yb = yb.to(device)
             pred = model(xb)
+            
+            # Vérifier les NaN dans les prédictions
+            if torch.isnan(pred).any():
+                print(f"Warning: NaN detected in model predictions!")
+                # Remplacer les NaN par zéro ou une valeur par défaut
+                pred = torch.where(torch.isnan(pred), torch.zeros_like(pred), pred)
+            
             # rescale to original label units if normalized
             if (label_mean is not None) and (label_std is not None):
                 pred_res = (pred.cpu().numpy() * label_std) + label_mean
@@ -27,13 +34,31 @@ def evaluate_model_exact(model, loader, device, label_mean=None, label_std=None)
             else:
                 pred_res = pred.cpu().numpy()
                 yb_res = yb.cpu().numpy()
+            
             y_preds.append(pred_res.ravel())
             y_trues.append(yb_res.ravel())
+    
     y_pred = np.concatenate(y_preds)
     y_true = np.concatenate(y_trues)
-    r2 = r2_score(y_true, y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    
+    # Vérifier et nettoyer les NaN avant le calcul des métriques
+    valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred) | np.isinf(y_true) | np.isinf(y_pred))
+    
+    if not valid_mask.any():
+        print("Warning: All predictions are NaN/inf, returning default metrics")
+        return -1.0, float('inf'), float('inf')
+    
+    y_true_clean = y_true[valid_mask]
+    y_pred_clean = y_pred[valid_mask]
+    
+    try:
+        r2 = r2_score(y_true_clean, y_pred_clean)
+        mae = mean_absolute_error(y_true_clean, y_pred_clean)
+        rmse = np.sqrt(mean_squared_error(y_true_clean, y_pred_clean))
+    except Exception as e:
+        print(f"Error computing metrics: {e}")
+        return -1.0, float('inf'), float('inf')
+    
     return r2, mae, rmse
 
 def train_and_evaluate(model, train_loader, val_loader, device, input_mean, input_std, label_mean, label_std,
@@ -55,7 +80,13 @@ def train_and_evaluate(model, train_loader, val_loader, device, input_mean, inpu
     else:
         sched = None
 
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    # Correction 1: Utiliser la nouvelle API pour GradScaler
+    if amp and torch.cuda.is_available():
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        scaler = None
+        amp = False  # Désactiver AMP si pas de CUDA
+    
     best_r2 = -1e9
     history = []
     es_counter = 0
@@ -65,22 +96,63 @@ def train_and_evaluate(model, train_loader, val_loader, device, input_mean, inpu
         model.train()
         running_loss, n = 0.0, 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
+        
         for xb, yb in pbar:
             xb = xb.to(device).float()
             yb = yb.to(device).float()
+            
+            # Vérifier les données d'entrée
+            if torch.isnan(xb).any() or torch.isnan(yb).any():
+                print("Warning: NaN in input data, skipping batch")
+                continue
+            
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp):
+            
+            # Correction 2: Utiliser la nouvelle API pour autocast
+            if amp:
+                with torch.amp.autocast('cuda'):
+                    pred = model(xb)
+                    
+                    # Vérifier les prédictions avant de calculer les losses
+                    if torch.isnan(pred).any():
+                        print("Warning: NaN in model output!")
+                        continue
+                    
+                    l_h = huber(pred, yb)
+                    l_r2 = r2loss(pred, yb)
+                    l_ssim = ssim_loss(pred, yb)
+                    loss = alpha * l_h + beta * l_r2 + gamma * l_ssim
+            else:
                 pred = model(xb)
+                
+                # Vérifier les prédictions avant de calculer les losses
+                if torch.isnan(pred).any():
+                    print("Warning: NaN in model output!")
+                    continue
+                
                 l_h = huber(pred, yb)
                 l_r2 = r2loss(pred, yb)
                 l_ssim = ssim_loss(pred, yb)
                 loss = alpha * l_h + beta * l_r2 + gamma * l_ssim
-            scaler.scale(loss).backward()
-            if clip_grad and clip_grad > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            scaler.step(optimizer)
-            scaler.update()
+            
+            # Vérifier la loss avant la backpropagation
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: Invalid loss detected: {loss.item()}")
+                continue
+            
+            # Backpropagation avec ou sans AMP
+            if amp and scaler is not None:
+                scaler.scale(loss).backward()
+                if clip_grad and clip_grad > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if clip_grad and clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                optimizer.step()
 
             running_loss += float(loss.item())
             n += 1
@@ -106,14 +178,17 @@ def train_and_evaluate(model, train_loader, val_loader, device, input_mean, inpu
             yb_vis = yb_vis.to(device).float()
             with torch.no_grad():
                 pr_vis = model(xb_vis)
-            pr_np = (pr_vis[0,0].cpu().numpy() * label_std) + label_mean
-            gt_np = (yb_vis[0,0].cpu().numpy() * label_std) + label_mean
-            save_prediction(os.path.join(outdir, f'epoch_{epoch:03d}.png'), gt_np, pr_np)
+                
+            # Vérifier les NaN dans les visualisations
+            if not torch.isnan(pr_vis).any() and not torch.isnan(yb_vis).any():
+                pr_np = (pr_vis[0,0].cpu().numpy() * label_std) + label_mean
+                gt_np = (yb_vis[0,0].cpu().numpy() * label_std) + label_mean
+                save_prediction(os.path.join(outdir, f'epoch_{epoch:03d}.png'), gt_np, pr_np)
         except Exception as e:
-            pass
+            print(f"Warning: Could not save prediction visualization: {e}")
 
         # Save best - COMME DANS VOTRE CODE
-        if val_r2 > best_r2:
+        if val_r2 > best_r2 and not np.isnan(val_r2):
             best_r2 = val_r2
             torch.save({
                 'epoch': epoch,
