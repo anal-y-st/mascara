@@ -1,5 +1,7 @@
 import argparse, yaml, importlib, importlib.util, os, sys, logging
 import torch
+import numpy as np
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from tqdm import tqdm
 from models.registry import get_model
 from trainers.trainer import train_and_evaluate
@@ -103,6 +105,149 @@ def ensure_numeric_config(cfg):
                     elif isinstance(item, dict):
                         ensure_numeric_config(item)
     return cfg
+
+def evaluate_model(model, loader, device, label_mean=None, label_std=None, logger=None):
+    """
+    Evaluate model with robust NaN handling and progress tracking
+    
+    Args:
+        model: PyTorch model to evaluate
+        loader: DataLoader for evaluation data
+        device: Device to run evaluation on
+        label_mean: Mean for label denormalization (scalar)
+        label_std: Std for label denormalization (scalar)
+        logger: Logger instance for reporting
+    
+    Returns:
+        tuple: (r2, mae, rmse) or dict with detailed metrics if NaN issues
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    model.eval()
+    y_trues, y_preds = [], []
+    
+    logger.info("Starting model evaluation...")
+    
+    with torch.no_grad():
+        # Use tqdm for progress bar
+        pbar = tqdm(loader, desc="Evaluating", leave=False)
+        
+        for batch_idx, (xb, yb) in enumerate(pbar):
+            xb = xb.to(device)
+            yb = yb.to(device)
+            
+            # Forward pass
+            try:
+                pred = model(xb)
+            except Exception as e:
+                logger.error(f"Model forward pass failed on batch {batch_idx}: {e}")
+                continue
+            
+            # Check for NaN in model output immediately
+            if torch.isnan(pred).any():
+                nan_count = torch.isnan(pred).sum().item()
+                total = pred.numel()
+                logger.warning(f"Batch {batch_idx}: Model output contains {nan_count}/{total} NaN values")
+            
+            # Rescale to original label units if normalized
+            if (label_mean is not None) and (label_std is not None):
+                # Convert to CPU and numpy first, then rescale
+                pred_cpu = pred.cpu().numpy()
+                yb_cpu = yb.cpu().numpy()
+                
+                pred_res = (pred_cpu * label_std) + label_mean
+                yb_res = (yb_cpu * label_std) + label_mean
+            else:
+                pred_res = pred.cpu().numpy()
+                yb_res = yb.cpu().numpy()
+            
+            # Check for NaN after rescaling
+            if np.isnan(pred_res).any() or np.isnan(yb_res).any():
+                pred_nan = np.isnan(pred_res).sum()
+                true_nan = np.isnan(yb_res).sum()
+                if pred_nan > 0:
+                    logger.warning(f"Batch {batch_idx}: {pred_nan} NaN in rescaled predictions")
+                if true_nan > 0:
+                    logger.warning(f"Batch {batch_idx}: {true_nan} NaN in rescaled targets")
+            
+            y_preds.append(pred_res.ravel())
+            y_trues.append(yb_res.ravel())
+            
+            # Update progress bar with batch info
+            pbar.set_postfix({
+                'batch': f"{batch_idx+1}/{len(loader)}",
+                'pred_range': f"[{pred_res.min():.2f}, {pred_res.max():.2f}]"
+            })
+    
+    # Concatenate all predictions and targets
+    logger.info("Concatenating predictions...")
+    y_pred = np.concatenate(y_preds)
+    y_true = np.concatenate(y_trues)
+    
+    logger.info(f"Total samples: {len(y_pred)}")
+    logger.info(f"Prediction range: [{y_pred.min():.4f}, {y_pred.max():.4f}]")
+    logger.info(f"Target range: [{y_true.min():.4f}, {y_true.max():.4f}]")
+    
+    # Check for NaN values in final arrays
+    pred_has_nan = np.isnan(y_pred).any()
+    true_has_nan = np.isnan(y_true).any()
+    
+    if pred_has_nan or true_has_nan:
+        pred_nan_count = np.isnan(y_pred).sum()
+        true_nan_count = np.isnan(y_true).sum()
+        logger.warning(f"Final arrays - Predictions: {pred_nan_count} NaN, Targets: {true_nan_count} NaN")
+        
+        # Create mask for valid (non-NaN) values
+        valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+        
+        if not valid_mask.any():
+            logger.error("All values are NaN! Cannot compute metrics.")
+            return {'r2': float('nan'), 'mae': float('nan'), 'rmse': float('nan'), 
+                    'valid_samples': 0, 'total_samples': len(y_pred)}
+        
+        logger.info(f"Using {valid_mask.sum()}/{len(y_pred)} valid samples for metrics")
+        y_true_clean = y_true[valid_mask]
+        y_pred_clean = y_pred[valid_mask]
+    else:
+        y_true_clean = y_true
+        y_pred_clean = y_pred
+    
+    # Check for infinite values
+    if np.isinf(y_pred_clean).any() or np.isinf(y_true_clean).any():
+        logger.warning("Found infinite values, filtering them out...")
+        finite_mask = np.isfinite(y_true_clean) & np.isfinite(y_pred_clean)
+        if not finite_mask.any():
+            logger.error("No finite values found!")
+            return {'r2': float('nan'), 'mae': float('nan'), 'rmse': float('nan'),
+                    'valid_samples': 0, 'total_samples': len(y_pred)}
+        y_true_clean = y_true_clean[finite_mask]
+        y_pred_clean = y_pred_clean[finite_mask]
+    
+    # Compute metrics
+    logger.info("Computing evaluation metrics...")
+    try:
+        mae = mean_absolute_error(y_true_clean, y_pred_clean)
+        rmse = np.sqrt(mean_squared_error(y_true_clean, y_pred_clean))
+        
+        # R2 can fail if all targets are the same (zero variance)
+        try:
+            r2 = r2_score(y_true_clean, y_pred_clean)
+        except ValueError as e:
+            logger.warning(f"R2 computation failed: {e} (possibly zero variance in targets)")
+            r2 = float('nan')
+        
+        logger.info(f"Metrics computed successfully:")
+        logger.info(f"  R²: {r2:.6f}")
+        logger.info(f"  MAE: {mae:.6f}")
+        logger.info(f"  RMSE: {rmse:.6f}")
+        logger.info(f"  Samples used: {len(y_true_clean)}/{len(y_pred)}")
+        
+        return r2, mae, rmse
+    
+    except Exception as e:
+        logger.error(f"Error computing metrics: {e}")
+        return float('nan'), float('nan'), float('nan')
 
 def check_for_nans(tensor, name="tensor"):
     """Check if tensor contains NaN values and log warning"""
@@ -220,6 +365,7 @@ def main():
         label_mean=label_mean,
         label_std=label_std,
         logger=logger,  # Pass logger to train_and_evaluate
+        evaluate_fn=evaluate_model,  # Pass our custom evaluation function
         **cfg["training"]
     )
     
