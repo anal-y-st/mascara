@@ -364,8 +364,7 @@ def main():
         input_std=input_std,
         label_mean=label_mean,
         label_std=label_std,
-        logger=logger,  # Pass logger to train_and_evaluate
-        evaluate_fn=evaluate_model,  # Pass our custom evaluation function
+        evaluate_fn=evaluate_model,  # Pass a custom evaluation function
         **cfg["training"]
     )
     
