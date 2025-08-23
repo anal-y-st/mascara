@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 def evaluate_numpy(y_true, y_pred):
