@@ -8,23 +8,48 @@ from metrics.evaluation import evaluate_numpy
 from utils.visualization import plot_curves, save_prediction
 from utils.reporting import save_report
 
-def evaluate_model(model, loader, device, label_mean=None, label_std=None):
+# Remplacer la fonction evaluate_model dans trainers/trainer.py par ceci :
+
+def evaluate_model(model, loader, device, label_mean=None, label_std=None, logger=None):
+    """Version corrigée qui évite les NaN"""
+    import logging
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
     model.eval()
-    preds, trues = [], []
+    y_trues, y_preds = [], []
+    
     with torch.no_grad():
         for xb, yb in loader:
-            xb = xb.to(device).float()
-            yb = yb.to(device).float()
-            pr = model(xb)
-            pr_np = pr.detach().cpu().numpy()
-            yb_np = yb.detach().cpu().numpy()
+            xb = xb.to(device)
+            yb = yb.to(device)
+            pred = model(xb)
+            
+            # Vérifier les NaN dans la prédiction du modèle
+            if torch.isnan(pred).any():
+                logger.warning("NaN detected in model output!")
+                
+            # Rescale to original label units if normalized (SUR LES TENSEURS)
             if (label_mean is not None) and (label_std is not None):
-                pr_np = pr_np * label_std + label_mean
-                yb_np = yb_np * label_std + label_mean
-            preds.append(pr_np.ravel())
-            trues.append(yb_np.ravel())
-    y_pred = np.concatenate(preds)
-    y_true = np.concatenate(trues)
+                pred_res = (pred.cpu().numpy() * label_std) + label_mean
+                yb_res = (yb.cpu().numpy() * label_std) + label_mean
+            else:
+                pred_res = pred.cpu().numpy()
+                yb_res = yb.cpu().numpy()
+            
+            # Vérifier les NaN après dénormalisation
+            if np.isnan(pred_res).any() or np.isnan(yb_res).any():
+                logger.warning("NaN detected after denormalization!")
+                logger.warning(f"label_mean={label_mean}, label_std={label_std}")
+                
+            y_preds.append(pred_res.ravel())
+            y_trues.append(yb_res.ravel())
+    
+    y_pred = np.concatenate(y_preds)
+    y_true = np.concatenate(y_trues)
+    
+    # Retour au format du codebase
+    from metrics.evaluation import evaluate_numpy
     return evaluate_numpy(y_true, y_pred)
 
 def train_and_evaluate(model, train_loader, val_loader, device, input_mean, input_std, label_mean, label_std,
